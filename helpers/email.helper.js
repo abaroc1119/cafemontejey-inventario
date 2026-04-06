@@ -14,7 +14,9 @@ const sendPasswordResetEmail = async (userEmail, token) => {
             },
         });
 
-        const resetLink = `http://localhost:5173/reset-password/${token}`;
+        // Use FRONTEND_URL env var if provided (e.g. https://inventario.cafemontejey.com)
+        const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+        const resetLink = `${FRONTEND_URL.replace(/\/$/, '')}/reset-password/${token}`;
 
         const mailOptions = {
             from: '"GestioNexus" <soporte@gestioneexus.com>',

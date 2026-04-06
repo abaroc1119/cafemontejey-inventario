@@ -1,5 +1,6 @@
 const pool = require('../db/database');
 const { logAction } = require('../helpers/audit.helper');
+const { registerInventoryMovement, increaseBatchStock } = require('../services/inventory.service');
 
 const getLayawayPlans = async (req, res) => {
     const { search = '', status = 'active' } = req.query;
@@ -16,7 +17,7 @@ const getLayawayPlans = async (req, res) => {
         const [plans] = await pool.query(query, queryParams);
         res.json(plans);
     } catch (error) {
-        console.error("Error al obtener planes separe:", error);
+        console.error('Error al obtener planes separe:', error);
         res.status(500).json({ msg: 'Error al obtener los planes separe' });
     }
 };
@@ -31,33 +32,32 @@ const getLayawayPlanById = async (req, res) => {
 
         const [products] = await pool.query(
             `SELECT 
-                d.quantity, 
+                d.quantity, d.batch_id,
                 p.price as price_at_sale, 
                 p.name as product_name, 
                 p.id as product_id,
                 p.sku as product_sku,
                 p.attributes as product_attributes,
-                p.cost as product_cost
+                pb.batch_code, pb.cost_per_unit,
+                sup.company_name as supplier_name
              FROM layaway_plan_details d 
-             JOIN products p ON d.product_id = p.id 
+             JOIN products p ON d.product_id = p.id
+             LEFT JOIN product_batches pb ON d.batch_id = pb.id
+             LEFT JOIN suppliers sup ON pb.supplier_id = sup.id
              WHERE d.layaway_plan_id = ?`,
             [id]
         );
 
         res.json({ ...plan, products: products });
     } catch (error) {
-        console.error("Error al obtener el detalle del plan separe:", error);
+        console.error('Error al obtener el detalle del plan separe:', error);
         res.status(500).json({ msg: 'Error al obtener el detalle del plan' });
     }
 };
 
 const createLayawayPlan = async (req, res) => {
-    const { 
-        customer_name, customer_id_doc, customer_contact, 
-        total_value, down_payment, deadline, products,
-        iva_rate = 0, iva_amount = 0 
-    } = req.body;
-    
+    const { customer_name, customer_id_doc, customer_contact, total_value, down_payment, deadline, products } = req.body;
+
     if (!products || !Array.isArray(products) || products.length === 0) {
         return res.status(400).json({ msg: 'La lista de productos no puede estar vacía.' });
     }
@@ -67,38 +67,54 @@ const createLayawayPlan = async (req, res) => {
 
     try {
         await connection.beginTransaction();
+
         for (const product of products) {
-            const [[dbProduct]] = await connection.query('SELECT quantity, name FROM products WHERE id = ? FOR UPDATE', [product.product_id]);
-            if (!dbProduct || dbProduct.quantity < product.quantity) {
+            const [[batch]] = await connection.query(
+                'SELECT pb.current_quantity, p.name FROM product_batches pb JOIN products p ON pb.product_id = p.id WHERE pb.id = ? FOR UPDATE',
+                [product.batch_id]
+            );
+            if (!batch || batch.current_quantity < product.quantity) {
                 await connection.rollback();
-                return res.status(400).json({ msg: `Stock insuficiente para el producto: ${dbProduct.name}` });
+                return res.status(400).json({
+                    msg: `Stock insuficiente en el lote para: ${batch?.name || 'producto desconocido'}`
+                });
             }
         }
 
         const [planResult] = await connection.query(
-            'INSERT INTO layaway_plans (customer_name, customer_id_doc, customer_contact, total_value, down_payment, balance_due, deadline, iva_rate, iva_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [customer_name, customer_id_doc, customer_contact, total_value, down_payment, balance_due, deadline, iva_rate, iva_amount]
+            'INSERT INTO layaway_plans (customer_name, customer_id_doc, customer_contact, total_value, down_payment, balance_due, deadline) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [customer_name, customer_id_doc, customer_contact, total_value, down_payment, balance_due, deadline]
         );
-        
         const planId = planResult.insertId;
 
-        const detailQueries = products.map(product => {
-            return connection.query(
-                'INSERT INTO layaway_plan_details (layaway_plan_id, product_id, quantity) VALUES (?, ?, ?)',
-                [planId, product.product_id, product.quantity]
+        for (const product of products) {
+            await connection.query(
+                'INSERT INTO layaway_plan_details (layaway_plan_id, product_id, batch_id, quantity) VALUES (?, ?, ?, ?)',
+                [planId, product.product_id, product.batch_id, product.quantity]
             );
-        });
-        await Promise.all(detailQueries);
 
-        // --- INICIO DE LA MODIFICACIÓN ---
-        // Se registra el abono inicial junto con la referencia directa al plan (layaway_plan_id).
+            await connection.query(
+                'UPDATE product_batches SET current_quantity = current_quantity - ? WHERE id = ?',
+                [product.quantity, product.batch_id]
+            );
+
+            await registerInventoryMovement(connection, {
+                productId: product.product_id,
+                batchId: product.batch_id,
+                movementType: 'RESERVE',
+                quantity: parseInt(product.quantity, 10),
+                referenceType: 'layaway',
+                referenceId: planId,
+                notes: `Reserva por plan separe #${planId}`
+            });
+        }
+
         if (down_payment > 0) {
             await connection.query(
-                'INSERT INTO financial_ledger (entry_date, concept, income, layaway_plan_id) VALUES (CURDATE(), ?, ?, ?)',
-                [`Abono inicial Plan #${planId} - ${customer_name}`, down_payment, planId]
+                'INSERT INTO financial_ledger (entry_date, concept, income) VALUES (CURDATE(), ?, ?)',
+                [`Abono inicial Plan Separe #${planId} - ${customer_name}`, down_payment]
             );
         }
-        // --- FIN DE LA MODIFICACIÓN ---
 
         await connection.commit();
         const [newPlan] = await pool.query('SELECT * FROM layaway_plans WHERE id = ?', [planId]);
@@ -107,8 +123,8 @@ const createLayawayPlan = async (req, res) => {
 
     } catch (error) {
         await connection.rollback();
-        console.error("Error detallado al crear plan separe:", error);
-        res.status(500).json({ msg: 'Error interno al guardar los detalles del plan.', error: error.message });
+        console.error('Error detallado al crear plan separe:', error);
+        res.status(500).json({ msg: error.message || 'Error interno al guardar los detalles del plan.' });
     } finally {
         connection.release();
     }
@@ -127,15 +143,14 @@ const updateLayawayPlan = async (req, res) => {
             await connection.rollback();
             return res.status(404).json({ msg: 'Plan separe no encontrado' });
         }
-        
-        let newStatus = plan.status;
-        
-        if (new_payment_amount && !isNaN(new_payment_amount) && new_payment_amount > 0) {
+
+        if (new_payment_amount && !isNaN(new_payment_amount)) {
             const payment = parseFloat(new_payment_amount);
             let { down_payment, balance_due, customer_name } = plan;
 
             down_payment = parseFloat(down_payment) + payment;
             balance_due = parseFloat(balance_due) - payment;
+            let newStatus = plan.status;
 
             if (balance_due <= 0) {
                 newStatus = 'completed';
@@ -147,68 +162,19 @@ const updateLayawayPlan = async (req, res) => {
                 [down_payment, balance_due, newStatus, id]
             );
 
-            // --- INICIO DE LA MODIFICACIÓN ---
-            // Se registra el abono con la referencia directa al plan (layaway_plan_id).
-            const [ledgerResult] = await connection.query(
-                'INSERT INTO financial_ledger (entry_date, concept, income, layaway_plan_id) VALUES (CURDATE(), ?, ?, ?)',
-                [`Abono a Plan #${id} - ${customer_name}`, payment, id]
+            await connection.query(
+                'INSERT INTO financial_ledger (entry_date, concept, income) VALUES (CURDATE(), ?, ?)',
+                [`Abono a Plan Separe #${id} - ${customer_name}`, payment]
             );
-            const ledgerEntryId = ledgerResult.insertId;
-            // --- FIN DE LA MODIFICACIÓN ---
-
-            if (newStatus === 'completed') {
-                const [[customer]] = await connection.query(
-                    'SELECT id FROM customers WHERE full_name = ? OR id_document = ? LIMIT 1',
-                    [plan.customer_name, plan.customer_id_doc]
-                );
-                const customerId = customer ? customer.id : null;
-
-                const [saleResult] = await connection.query(
-                    `INSERT INTO sales (user_id, customer_id, total_amount, discount, created_at, iva_rate, iva_amount, layaway_plan_id)
-                     VALUES (?, ?, ?, ?, NOW(), ?, ?, ?)`,
-                    [uid, customerId, plan.total_value, 0, plan.iva_rate, plan.iva_amount, id]
-                );
-                const newSaleId = saleResult.insertId;
-
-                const [planDetails] = await connection.query(
-                    `SELECT lpd.quantity, p.id as product_id, p.price, p.cost 
-                     FROM layaway_plan_details lpd
-                     JOIN products p ON lpd.product_id = p.id
-                     WHERE lpd.layaway_plan_id = ?`,
-                    [id]
-                );
-                
-                for (const detail of planDetails) {
-                    await connection.query(
-                        `INSERT INTO sale_details (sale_id, product_id, quantity, unit_price, unit_cost)
-                         VALUES (?, ?, ?, ?, ?)`,
-                        [newSaleId, detail.product_id, detail.quantity, detail.price, detail.cost]
-                    );
-                }
-                
-                // --- INICIO DE LA MODIFICACIÓN ---
-                // Se actualiza el abono final para incluir también la referencia a la venta (sale_id).
-                await connection.query(
-                    `UPDATE financial_ledger SET concept = ?, sale_id = ? WHERE id = ?`,
-                    [`Cierre Plan #${id} (Venta #${newSaleId})`, newSaleId, ledgerEntryId]
-                );
-                // --- FIN DE LA MODIFICACIÓN ---
-                
-                await logAction(uid, `Completó el plan separe (ID: ${id}) y lo convirtió a Venta (ID: ${newSaleId})`);
-            }
         }
 
         const [[updatedPlan]] = await connection.query('SELECT * FROM layaway_plans WHERE id = ?', [id]);
         await connection.commit();
-
-        if (newStatus !== 'completed' && new_payment_amount > 0) {
-             await logAction(uid, `Registró un abono al plan separe (ID: ${id}).`);
-        }
-        
+        await logAction(uid, `Actualizó el plan separe (ID: ${id}) con un abono.`);
         res.json(updatedPlan);
     } catch (error) {
         await connection.rollback();
-        console.error("Error al actualizar el plan:", error);
+        console.error('Error al actualizar el plan:', error);
         res.status(500).json({ msg: 'Error al actualizar el plan' });
     } finally {
         connection.release();
@@ -221,14 +187,31 @@ const deleteLayawayPlan = async (req, res) => {
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
+
+        const [details] = await connection.query(
+            'SELECT product_id, batch_id, quantity FROM layaway_plan_details WHERE layaway_plan_id = ?',
+            [id]
+        );
+
+        for (const detail of details) {
+            if (detail.batch_id) {
+                await increaseBatchStock(detail.batch_id, detail.quantity, connection, {
+                    movementType: 'RELEASE',
+                    referenceType: 'layaway_cancel',
+                    referenceId: parseInt(id, 10),
+                    notes: `Liberación por cancelación del plan separe #${id}`
+                });
+            }
+        }
+
         await connection.query('DELETE FROM layaway_plan_details WHERE layaway_plan_id = ?', [id]);
         await connection.query('DELETE FROM layaway_plans WHERE id = ?', [id]);
         await connection.commit();
         await logAction(uid, `Eliminó/Canceló el plan separe (ID: ${id})`);
-        res.json({ msg: 'Plan separe eliminado y stock devuelto.' });
+        res.json({ msg: 'Plan separe eliminado y stock devuelto a los lotes correspondientes.' });
     } catch (error) {
         await connection.rollback();
-        console.error("Error al eliminar plan separe:", error);
+        console.error('Error al eliminar plan separe:', error);
         res.status(500).json({ msg: 'Error al eliminar el plan separe' });
     } finally {
         connection.release();

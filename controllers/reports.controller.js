@@ -57,15 +57,15 @@ const getFinancialLedger = async (req, res) => {
         const [[{ total }]] = await pool.query(`SELECT COUNT(*) as total FROM financial_ledger fl ${whereClause}`, params);
         
         const [[summary]] = await pool.query(`
-            SELECT
-                SUM(fl.income) as totalIncome,
-                SUM(fl.expense) as totalExpense
-            FROM financial_ledger fl
-            ${whereClause}
-        `, params);
+    SELECT
+        COALESCE(SUM(fl.income), 0) as totalIncome,
+        COALESCE(SUM(fl.expense), 0) as totalExpense
+    FROM financial_ledger fl
+    ${whereClause}
+`, params);
 
         let ivaQuery = `SELECT SUM(iva_amount) as totalIva FROM sales s`;
-        if (startDate && endDate) {
+        if (startDate && endDate && startDate !== '' && endDate !== '') {
             ivaQuery += ` WHERE s.created_at BETWEEN ? AND ?`;
         }
         const [[{ totalIva }]] = await pool.query(ivaQuery, (startDate && endDate) ? [`${startDate} 00:00:00`, `${endDate} 23:59:59`] : []);

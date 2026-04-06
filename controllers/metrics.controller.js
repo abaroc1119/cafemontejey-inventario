@@ -33,9 +33,7 @@ const getMetrics = async (req, res) => {
             ORDER BY sale_date ASC;`,
             dateParams
         );
-        
-        // --- INICIO DE LA MODIFICACIÓN (Ranking de Empleados) ---
-        // La consulta ahora calcula el total vendido basado en el ingreso NETO (total_amount - iva_amount).
+
         const [employeeRanking] = await pool.query(
             `SELECT 
                 u.full_name, 
@@ -47,7 +45,6 @@ const getMetrics = async (req, res) => {
             ORDER BY total_sold DESC;`,
             dateParams
         );
-        // --- FIN DE LA MODIFICACIÓN ---
 
         const [productRankingByQuantity] = await pool.query(
             `SELECT p.name, SUM(sd.quantity) as total_quantity_sold
@@ -63,18 +60,25 @@ const getMetrics = async (req, res) => {
             dateParams
         );
 
+        // Productos estancados: activos que NUNCA se han vendido
         const [stagnantProducts] = await pool.query(
-            `SELECT p.name, p.quantity as stock, p.cost, p.price
-            FROM products p LEFT JOIN sale_details sd ON p.id = sd.product_id
-            WHERE sd.product_id IS NULL AND p.is_active = TRUE;`
+            `SELECT p.name, 
+                    COALESCE(SUM(pb.current_quantity), 0) as stock,
+                    CASE WHEN SUM(pb.current_quantity) > 0 
+                         THEN ROUND(SUM(pb.current_quantity * pb.cost_per_unit) / SUM(pb.current_quantity), 2)
+                         ELSE 0 END as cost,
+                    p.price
+            FROM products p 
+            LEFT JOIN sale_details sd ON p.id = sd.product_id
+            LEFT JOIN product_batches pb ON p.id = pb.product_id AND pb.current_quantity > 0
+            WHERE sd.product_id IS NULL AND p.is_active = TRUE
+            GROUP BY p.id, p.name, p.price;`
         );
-        
-        // --- INICIO DE LA MODIFICACIÓN (Añadir IVA Recaudado) ---
+
         const [[{ totalIva }]] = await pool.query(
             `SELECT SUM(iva_amount) as totalIva FROM sales s ${dateParams.length > 0 ? 'WHERE s.created_at BETWEEN ? AND ?' : ''}`,
             dateParams
         );
-        // --- FIN DE LA MODIFICACIÓN ---
 
         const totalIncome = financialSummary.totalIncome || 0;
         const totalExpense = financialSummary.totalExpense || 0;
@@ -84,7 +88,7 @@ const getMetrics = async (req, res) => {
             totalIncome: totalIncome,
             salesCount: salesCount || 0,
             grossProfit: netProfit,
-            totalIvaCollected: totalIva || 0, // Se añade el nuevo dato del IVA
+            totalIvaCollected: totalIva || 0,
             salesData: incomeData,
             employeeRanking,
             productRankingByQuantity,

@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const morgan = 'morgan'; 
+const morgan = require('morgan');
 const path = require('path');
 require('dotenv').config();
 
@@ -9,6 +9,7 @@ const app = express();
 // Middlewares
 app.use(cors());
 app.use(express.json());
+app.use(morgan('dev'));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Rutas
@@ -25,10 +26,13 @@ app.use('/api/notifications', require('./routes/notifications.routes'));
 app.use('/api/metrics', require('./routes/metrics.routes'));
 app.use('/api/categories', require('./routes/categories.routes'));
 app.use('/api/customers', require('./routes/customers.routes'));
-
-// --- RUTA DEL NUEVO MÓDULO DE CONFIGURACIÓN ---
 app.use('/api/config', require('./routes/config.routes'));
 
+// --- NUEVA RUTA DE LOTES ---
+app.use('/api/batches', require('./routes/batches.routes'));
+
+// --- RUTA DE LOTES VERDES (materia prima → derivados) ---
+app.use('/api/green-lots', require('./routes/greenLots.routes'));
 
 // Iniciar el servidor
 const PORT = process.env.PORT || 4000;
