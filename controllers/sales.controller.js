@@ -26,7 +26,7 @@ const getSales = async (req, res) => {
         const salesQuery = `
             SELECT 
                 s.id, s.total_amount, s.discount, s.created_at, u.full_name as user_name,
-                s.iva_rate, s.iva_amount,
+                s.iva_rate, s.iva_amount, s.payment_method,
                 SUM(sd.quantity * sd.unit_cost) as total_cost,
                 (s.total_amount - s.iva_amount - SUM(sd.quantity * sd.unit_cost)) as profit
             FROM sales s
@@ -63,7 +63,7 @@ const getSaleById = async (req, res) => {
     try {
         const [[sale]] = await pool.query(
             `SELECT s.id, s.total_amount, s.discount, s.created_at, u.full_name as user_name, 
-                    s.iva_rate, s.iva_amount, c.full_name as customer_name
+                    s.iva_rate, s.iva_amount, s.payment_method, c.full_name as customer_name
              FROM sales s
              JOIN users u ON s.user_id = u.id
              LEFT JOIN customers c ON s.customer_id = c.id
@@ -95,7 +95,7 @@ const getSaleById = async (req, res) => {
 };
 
 const createSale = async (req, res) => {
-    const { total_amount, products, discount = 0, customer_id = null, iva_rate = 0, iva_amount = 0 } = req.body;
+    const { total_amount, products, discount = 0, customer_id = null, iva_rate = 0, iva_amount = 0, payment_method = 'efectivo' } = req.body;
     const userId = req.uid;
     const connection = await pool.getConnection();
 
@@ -128,8 +128,8 @@ const createSale = async (req, res) => {
         }
 
         const [saleResult] = await connection.query(
-            'INSERT INTO sales (user_id, customer_id, total_amount, discount, iva_rate, iva_amount) VALUES (?, ?, ?, ?, ?, ?)',
-            [userId, customer_id, total_amount, discount, iva_rate, iva_amount]
+            'INSERT INTO sales (user_id, customer_id, total_amount, discount, iva_rate, iva_amount, payment_method) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [userId, customer_id, total_amount, discount, iva_rate, iva_amount, payment_method]
         );
         const saleId = saleResult.insertId;
 
