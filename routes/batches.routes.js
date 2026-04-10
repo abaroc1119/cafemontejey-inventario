@@ -39,7 +39,6 @@ router.post('/', [
 router.put('/:id', [
     isAdminRole,
     check('id', 'ID de lote no válido').isNumeric(),
-    check('cost_per_unit', 'El costo por unidad debe ser un número >= 0').isFloat({ min: 0 }),
     validateFields
 ], updateBatch);
 

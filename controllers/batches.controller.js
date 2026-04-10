@@ -250,17 +250,86 @@ const createBatch = async (req, res) => {
 
 const updateBatch = async (req, res) => {
     const { id } = req.params;
-    const { supplier_id, cost_per_unit, notes } = req.body;
+    const {
+        supplier_id, cost_per_unit, notes, entry_date,
+        margin_percent, suggested_price,
+        packaging_cost_total, bag_cost_total,
+        line_trilla_cost, line_molienda_cost, line_packaging_cost, line_bag_cost,
+    } = req.body;
     const userId = req.uid;
 
     try {
-        await pool.query(
-            'UPDATE product_batches SET supplier_id = ?, cost_per_unit = ?, notes = ? WHERE id = ?',
-            [supplier_id || null, cost_per_unit, notes || null, id]
+        // Obtener lote actual
+        const [[batch]] = await pool.query(
+            `SELECT pb.*, p.name as product_name, p.sku as product_sku
+             FROM product_batches pb
+             JOIN products p ON pb.product_id = p.id
+             WHERE pb.id = ?`,
+            [id]
         );
 
+        if (!batch) {
+            return res.status(404).json({ msg: 'Lote no encontrado.' });
+        }
+
+        // Construir SET dinámico solo con campos que vienen en el body
+        const updates = [];
+        const params = [];
+
+        if (supplier_id !== undefined) { updates.push('supplier_id = ?'); params.push(supplier_id || null); }
+        if (notes !== undefined) { updates.push('notes = ?'); params.push(notes || null); }
+        if (cost_per_unit !== undefined) { updates.push('cost_per_unit = ?'); params.push(roundCurrency(cost_per_unit)); }
+        if (entry_date !== undefined) { updates.push('entry_date = ?'); params.push(entry_date); }
+        if (margin_percent !== undefined) { updates.push('margin_percent = ?'); params.push(parseFloat(margin_percent)); }
+        if (suggested_price !== undefined) { updates.push('suggested_price = ?'); params.push(roundCurrency(suggested_price)); }
+        if (packaging_cost_total !== undefined) { updates.push('packaging_cost_total = ?'); params.push(roundCurrency(packaging_cost_total)); }
+        if (bag_cost_total !== undefined) { updates.push('bag_cost_total = ?'); params.push(roundCurrency(bag_cost_total)); }
+        if (line_trilla_cost !== undefined) { updates.push('line_trilla_cost = ?'); params.push(roundCurrency(line_trilla_cost)); }
+        if (line_molienda_cost !== undefined) { updates.push('line_molienda_cost = ?'); params.push(roundCurrency(line_molienda_cost)); }
+        if (line_packaging_cost !== undefined) { updates.push('line_packaging_cost = ?'); params.push(roundCurrency(line_packaging_cost)); }
+        if (line_bag_cost !== undefined) { updates.push('line_bag_cost = ?'); params.push(roundCurrency(line_bag_cost)); }
+
+        // Recalcular costo por unidad si se cambian costos de línea
+        if (line_molienda_cost !== undefined || line_packaging_cost !== undefined || line_bag_cost !== undefined) {
+            const molienda = line_molienda_cost !== undefined ? parseFloat(line_molienda_cost) : parseFloat(batch.line_molienda_cost || 0);
+            const packaging = line_packaging_cost !== undefined ? parseFloat(line_packaging_cost) : parseFloat(batch.line_packaging_cost || 0);
+            const bag = line_bag_cost !== undefined ? parseFloat(line_bag_cost) : parseFloat(batch.line_bag_cost || 0);
+
+            // Costo base proporcional (verde+flete+trilla+tostión ya prorrateado)
+            const baseGreenCost = parseFloat(batch.green_total_cost || 0);
+            const lineTotalCost = baseGreenCost + molienda + packaging + bag;
+            const qty = batch.initial_quantity;
+
+            if (qty > 0) {
+                const newCostPerUnit = roundCurrency(lineTotalCost / qty);
+                updates.push('cost_per_unit = ?'); params.push(newCostPerUnit);
+                updates.push('final_cost_per_unit = ?'); params.push(newCostPerUnit);
+
+                const unitWeightKg = parseFloat(batch.unit_weight_kg || 0);
+                const totalKg = qty * unitWeightKg;
+                if (totalKg > 0) {
+                    updates.push('final_cost_per_kg = ?'); params.push(roundCurrency(lineTotalCost / totalKg));
+                }
+
+                // Recalcular precio sugerido si hay margen
+                const margin = margin_percent !== undefined ? parseFloat(margin_percent) : parseFloat(batch.margin_percent || 40);
+                const marginFraction = margin > 1 ? margin / 100 : margin;
+                if (newCostPerUnit > 0 && marginFraction < 1) {
+                    const newSuggested = roundCurrency(newCostPerUnit / (1 - marginFraction));
+                    updates.push('suggested_price = ?'); params.push(newSuggested);
+                }
+            }
+        }
+
+        if (updates.length === 0) {
+            return res.status(400).json({ msg: 'No se proporcionaron campos para actualizar.' });
+        }
+
+        params.push(id);
+        await pool.query(`UPDATE product_batches SET ${updates.join(', ')} WHERE id = ?`, params);
+
         const [[updatedBatch]] = await pool.query(
-            `SELECT pb.*, s.company_name as supplier_name, p.name as product_name
+            `SELECT pb.*, s.company_name as supplier_name, p.name as product_name, p.sku as product_sku
              FROM product_batches pb
              LEFT JOIN suppliers s ON pb.supplier_id = s.id
              JOIN products p ON pb.product_id = p.id
@@ -268,7 +337,7 @@ const updateBatch = async (req, res) => {
             [id]
         );
 
-        await logAction(userId, `Actualizó el lote ${updatedBatch.batch_code} del producto '${updatedBatch.product_name}'`);
+        await logAction(userId, `Editó el lote ${updatedBatch.batch_code} del producto '${updatedBatch.product_name}'`);
         res.json(updatedBatch);
     } catch (error) {
         console.error('Error al actualizar lote:', error);
