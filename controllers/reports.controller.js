@@ -21,65 +21,130 @@ const getFinancialLedger = async (req, res) => {
     }
     const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
     
+    // Parámetros de fecha para ventas
+    let salesDateFilter = '';
+    let salesDateParams = [];
+    if (startDate && endDate) {
+        salesDateFilter = 'WHERE s.created_at BETWEEN ? AND ?';
+        salesDateParams = [`${startDate} 00:00:00`, `${endDate} 23:59:59`];
+    }
+
     try {
-        // --- INICIO DE LA CORRECCIÓN FINAL ---
+        // ─── Entradas del ledger (paginadas) ───
         const entriesQuery = `
             SELECT
-                fl.id,
-                fl.entry_date,
-                fl.concept,
-                -- Ingreso Bruto: Solo se calcula para ventas directas (sin layaway_plan_id). 
-                -- Para todos los abonos (con layaway_plan_id), el bruto es igual al neto.
+                fl.id, fl.entry_date, fl.concept,
                 CASE 
                     WHEN fl.sale_id IS NOT NULL AND fl.layaway_plan_id IS NULL THEN fl.income + COALESCE(s.iva_amount, 0)
                     ELSE fl.income 
                 END as gross_income,
-                
-                -- IVA: Solo se muestra en la fila que tiene una venta asociada (sea directa o de plan).
                 COALESCE(s.iva_amount, 0) as iva_amount,
-                
-                -- Ingreso Neto: Siempre es el valor del movimiento individual en el libro contable.
                 fl.income as net_income,
                 fl.expense
-            FROM 
-                financial_ledger fl
-            LEFT JOIN 
-                sales s ON fl.sale_id = s.id
+            FROM financial_ledger fl
+            LEFT JOIN sales s ON fl.sale_id = s.id
             ${whereClause}
-            ORDER BY 
-                fl.entry_date DESC, fl.id DESC 
+            ORDER BY fl.entry_date DESC, fl.id DESC 
             LIMIT ? OFFSET ?
         `;
-        // --- FIN DE LA CORRECCIÓN FINAL ---
-        
         const [entries] = await pool.query(entriesQuery, [...params, parseInt(limit), parseInt(offset)]);
 
-        const [[{ total }]] = await pool.query(`SELECT COUNT(*) as total FROM financial_ledger fl ${whereClause}`, params);
+        const [[{ total }]] = await pool.query(
+            `SELECT COUNT(*) as total FROM financial_ledger fl ${whereClause}`, params
+        );
         
-        const [[summary]] = await pool.query(`
-    SELECT
-        COALESCE(SUM(fl.income), 0) as totalIncome,
-        COALESCE(SUM(fl.expense), 0) as totalExpense
-    FROM financial_ledger fl
-    ${whereClause}
-`, params);
+        // ─── Resumen del ledger ───
+        const [[ledgerSummary]] = await pool.query(`
+            SELECT
+                COALESCE(SUM(fl.income), 0) as totalIncome,
+                COALESCE(SUM(fl.expense), 0) as totalExpense
+            FROM financial_ledger fl
+            ${whereClause}
+        `, params);
 
-        let ivaQuery = `SELECT SUM(iva_amount) as totalIva FROM sales s`;
-        if (startDate && endDate && startDate !== '' && endDate !== '') {
+        // ─── IVA recaudado ───
+        let ivaQuery = `SELECT COALESCE(SUM(iva_amount), 0) as totalIva FROM sales s`;
+        if (startDate && endDate) {
             ivaQuery += ` WHERE s.created_at BETWEEN ? AND ?`;
         }
-        const [[{ totalIva }]] = await pool.query(ivaQuery, (startDate && endDate) ? [`${startDate} 00:00:00`, `${endDate} 23:59:59`] : []);
+        const [[{ totalIva }]] = await pool.query(
+            ivaQuery, 
+            (startDate && endDate) ? [`${startDate} 00:00:00`, `${endDate} 23:59:59`] : []
+        );
+
+        // ─── Ganancia bruta real (desde sale_details) ───
+        const [[profitData]] = await pool.query(`
+            SELECT 
+                COALESCE(SUM(sd.quantity), 0) as totalUnits,
+                COALESCE(SUM(sd.quantity * sd.unit_price), 0) as totalSalesValue,
+                COALESCE(SUM(sd.quantity * sd.unit_cost), 0) as totalCostOfGoods,
+                COALESCE(SUM(sd.quantity * (sd.unit_price - sd.unit_cost)), 0) as grossProfit,
+                COUNT(DISTINCT s.id) as totalSalesCount
+            FROM sale_details sd
+            JOIN sales s ON sd.sale_id = s.id
+            ${salesDateFilter}
+        `, salesDateParams);
+
+        // ─── Desglose por producto ───
+        const [productBreakdown] = await pool.query(`
+            SELECT 
+                p.name, p.sku,
+                SUM(sd.quantity) as units_sold,
+                SUM(sd.quantity * sd.unit_price) as revenue,
+                SUM(sd.quantity * sd.unit_cost) as cost,
+                SUM(sd.quantity * (sd.unit_price - sd.unit_cost)) as profit,
+                CASE 
+                    WHEN SUM(sd.quantity * sd.unit_price) > 0 
+                    THEN ROUND(SUM(sd.quantity * (sd.unit_price - sd.unit_cost)) / SUM(sd.quantity * sd.unit_price) * 100, 1)
+                    ELSE 0 
+                END as margin_pct
+            FROM sale_details sd
+            JOIN sales s ON sd.sale_id = s.id
+            JOIN products p ON sd.product_id = p.id
+            ${salesDateFilter}
+            GROUP BY p.id, p.name, p.sku
+            ORDER BY revenue DESC
+        `, salesDateParams);
+
+        // ─── Desglose mensual ───
+        const [monthlyBreakdown] = await pool.query(`
+            SELECT 
+                DATE_FORMAT(s.created_at, '%Y-%m') as month_key,
+                DATE_FORMAT(s.created_at, '%M %Y') as month_label,
+                COUNT(DISTINCT s.id) as sales_count,
+                SUM(sd.quantity) as units_sold,
+                SUM(sd.quantity * sd.unit_price) as revenue,
+                SUM(sd.quantity * sd.unit_cost) as cost,
+                SUM(sd.quantity * (sd.unit_price - sd.unit_cost)) as profit
+            FROM sale_details sd
+            JOIN sales s ON sd.sale_id = s.id
+            ${salesDateFilter}
+            GROUP BY month_key, month_label
+            ORDER BY month_key ASC
+        `, salesDateParams);
 
         res.json({
             entries,
             totalPages: Math.ceil(total / limit),
             currentPage: parseInt(page),
             summary: {
-                totalIncome: summary.totalIncome || 0,
-                totalExpense: summary.totalExpense || 0,
-                netBalance: (summary.totalIncome || 0) - (summary.totalExpense || 0),
-                totalIvaCollected: totalIva || 0
-            }
+                // Ledger
+                totalIncome: ledgerSummary.totalIncome || 0,
+                totalExpense: ledgerSummary.totalExpense || 0,
+                netBalance: (ledgerSummary.totalIncome || 0) - (ledgerSummary.totalExpense || 0),
+                totalIvaCollected: totalIva || 0,
+                // Ventas reales
+                totalSalesCount: profitData.totalSalesCount || 0,
+                totalUnits: profitData.totalUnits || 0,
+                totalSalesValue: parseFloat(profitData.totalSalesValue) || 0,
+                totalCostOfGoods: parseFloat(profitData.totalCostOfGoods) || 0,
+                grossProfit: parseFloat(profitData.grossProfit) || 0,
+                avgMargin: profitData.totalSalesValue > 0
+                    ? Math.round((profitData.grossProfit / profitData.totalSalesValue) * 1000) / 10
+                    : 0,
+            },
+            productBreakdown,
+            monthlyBreakdown,
         });
     } catch (error) {
         console.error("Error al obtener el libro contable:", error);
@@ -111,8 +176,7 @@ const createFinancialEntry = async (req, res) => {
         res.status(201).json({ msg: 'Entrada contable creada' });
     } catch (error) {
         console.error("Error al registrar movimiento:", error);
-        const errorMsg = error.response?.data?.errors?.[0]?.msg || error.response?.data?.msg || 'No se pudo registrar el movimiento.';
-        res.status(500).json({ msg: errorMsg });
+        res.status(500).json({ msg: 'No se pudo registrar el movimiento.' });
     }
 };
 
@@ -135,11 +199,11 @@ const exportLedgerToExcel = async (req, res) => {
         const worksheet = workbook.addWorksheet('Reporte Financiero');
         worksheet.columns = [
             { header: 'Fecha', key: 'date', width: 15 },
-            { header: 'Concepto', key: 'concept', width: 40 },
-            { header: 'Ingreso Bruto', key: 'gross_income', width: 15, style: { numFmt: '"$"#,##0' } },
+            { header: 'Concepto', key: 'concept', width: 50 },
+            { header: 'Ingreso Bruto', key: 'gross_income', width: 18, style: { numFmt: '"$"#,##0' } },
             { header: 'IVA', key: 'iva_amount', width: 15, style: { numFmt: '"$"#,##0' } },
-            { header: 'Ingreso Neto', key: 'net_income', width: 15, style: { numFmt: '"$"#,##0' } },
-            { header: 'Egresos', key: 'expense', width: 15, style: { numFmt: '"$"#,##0' } },
+            { header: 'Ingreso Neto', key: 'net_income', width: 18, style: { numFmt: '"$"#,##0' } },
+            { header: 'Egresos', key: 'expense', width: 18, style: { numFmt: '"$"#,##0' } },
         ];
         ledgerData.forEach(row => {
             worksheet.addRow({
