@@ -47,10 +47,33 @@ const getSales = async (req, res) => {
             ${whereClause}`;
         const [[{ total }]] = await pool.query(countQuery, countParams);
 
+        // Totales globales (todas las ventas filtradas, no solo la página)
+        const [[globalTotals]] = await pool.query(`
+            SELECT 
+                COUNT(DISTINCT s.id) as total_sales,
+                COALESCE(SUM(s.total_amount), 0) as total_revenue,
+                COALESCE(SUM(s.iva_amount), 0) as total_iva,
+                COALESCE((SELECT SUM(sd2.quantity * sd2.unit_price) FROM sale_details sd2 JOIN sales s2 ON sd2.sale_id = s2.id ${whereClause.replace(/s\./g, 's2.')}), 0) as total_sales_value,
+                COALESCE((SELECT SUM(sd2.quantity * sd2.unit_cost) FROM sale_details sd2 JOIN sales s2 ON sd2.sale_id = s2.id ${whereClause.replace(/s\./g, 's2.')}), 0) as total_cost,
+                COALESCE((SELECT SUM(sd2.quantity * (sd2.unit_price - sd2.unit_cost)) FROM sale_details sd2 JOIN sales s2 ON sd2.sale_id = s2.id ${whereClause.replace(/s\./g, 's2.')}), 0) as total_profit,
+                COALESCE((SELECT SUM(sd2.quantity) FROM sale_details sd2 JOIN sales s2 ON sd2.sale_id = s2.id ${whereClause.replace(/s\./g, 's2.')}), 0) as total_units
+            FROM sales s
+            JOIN users u ON s.user_id = u.id
+            ${whereClause}
+        `, countParams);
+
         res.json({
             sales,
             totalPages: Math.ceil(total / limit),
             currentPage: parseInt(page, 10),
+            globalTotals: {
+                totalSales: globalTotals.total_sales || 0,
+                totalRevenue: parseFloat(globalTotals.total_revenue) || 0,
+                totalIva: parseFloat(globalTotals.total_iva) || 0,
+                totalCost: parseFloat(globalTotals.total_cost) || 0,
+                totalProfit: parseFloat(globalTotals.total_profit) || 0,
+                totalUnits: globalTotals.total_units || 0,
+            },
         });
     } catch (error) {
         console.error('Error al obtener las ventas:', error);
