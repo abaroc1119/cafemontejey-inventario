@@ -2,8 +2,14 @@ const pool = require('../db/database');
 const { logAction } = require('../helpers/audit.helper');
 const { registerInventoryMovement } = require('../services/inventory.service');
 
+const toNumber = (v, fb = 0) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fb;
+};
+const roundCurrency = (v) => Number(toNumber(v).toFixed(2));
+
 const getSales = async (req, res) => {
-    const { page = 1, limit = 15, userId, startDate, endDate } = req.query;
+    const { page = 1, limit = 15, userId, startDate, endDate, sellerId } = req.query;
     const offset = (page - 1) * limit;
 
     try {
@@ -15,6 +21,10 @@ const getSales = async (req, res) => {
             whereConditions.push('s.user_id = ?');
             params.push(userId);
         }
+        if (sellerId) {
+            whereConditions.push('s.seller_id = ?');
+            params.push(sellerId);
+        }
         if (startDate && endDate) {
             whereConditions.push('s.created_at BETWEEN ? AND ?');
             params.push(`${startDate} 00:00:00`, `${endDate} 23:59:59`);
@@ -24,13 +34,16 @@ const getSales = async (req, res) => {
         const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
 
         const salesQuery = `
-            SELECT 
+            SELECT
                 s.id, s.total_amount, s.discount, s.created_at, u.full_name as user_name,
                 s.iva_rate, s.iva_amount, s.payment_method,
+                s.seller_id, s.commission_amount, s.commission_rate, s.is_historical,
+                seller.full_name AS seller_name,
                 SUM(sd.quantity * sd.unit_cost) as total_cost,
                 (s.total_amount - s.iva_amount - SUM(sd.quantity * sd.unit_cost)) as profit
             FROM sales s
             JOIN users u ON s.user_id = u.id
+            LEFT JOIN sellers seller ON s.seller_id = seller.id
             JOIN sale_details sd ON s.id = sd.sale_id
             ${whereClause}
             GROUP BY s.id
@@ -40,19 +53,20 @@ const getSales = async (req, res) => {
         const [sales] = await pool.query(salesQuery, params);
 
         const countQuery = `
-            SELECT COUNT(DISTINCT s.id) as total 
+            SELECT COUNT(DISTINCT s.id) as total
             FROM sales s
             JOIN users u ON s.user_id = u.id
             JOIN sale_details sd ON s.id = sd.sale_id
             ${whereClause}`;
         const [[{ total }]] = await pool.query(countQuery, countParams);
 
-        // Totales globales (todas las ventas filtradas, no solo la página)
+        // Totales globales incluyendo comisiones
         const [[globalTotals]] = await pool.query(`
-            SELECT 
+            SELECT
                 COUNT(DISTINCT s.id) as total_sales,
                 COALESCE(SUM(s.total_amount), 0) as total_revenue,
                 COALESCE(SUM(s.iva_amount), 0) as total_iva,
+                COALESCE(SUM(s.commission_amount), 0) as total_commissions,
                 COALESCE((SELECT SUM(sd2.quantity * sd2.unit_price) FROM sale_details sd2 JOIN sales s2 ON sd2.sale_id = s2.id ${whereClause.replace(/s\./g, 's2.')}), 0) as total_sales_value,
                 COALESCE((SELECT SUM(sd2.quantity * sd2.unit_cost) FROM sale_details sd2 JOIN sales s2 ON sd2.sale_id = s2.id ${whereClause.replace(/s\./g, 's2.')}), 0) as total_cost,
                 COALESCE((SELECT SUM(sd2.quantity * (sd2.unit_price - sd2.unit_cost)) FROM sale_details sd2 JOIN sales s2 ON sd2.sale_id = s2.id ${whereClause.replace(/s\./g, 's2.')}), 0) as total_profit,
@@ -70,6 +84,7 @@ const getSales = async (req, res) => {
                 totalSales: globalTotals.total_sales || 0,
                 totalRevenue: parseFloat(globalTotals.total_revenue) || 0,
                 totalIva: parseFloat(globalTotals.total_iva) || 0,
+                totalCommissions: parseFloat(globalTotals.total_commissions) || 0,
                 totalCost: parseFloat(globalTotals.total_cost) || 0,
                 totalProfit: parseFloat(globalTotals.total_profit) || 0,
                 totalUnits: globalTotals.total_units || 0,
@@ -85,11 +100,14 @@ const getSaleById = async (req, res) => {
     const { id } = req.params;
     try {
         const [[sale]] = await pool.query(
-            `SELECT s.id, s.total_amount, s.discount, s.created_at, u.full_name as user_name, 
-                    s.iva_rate, s.iva_amount, s.payment_method, c.full_name as customer_name
+            `SELECT s.id, s.total_amount, s.discount, s.created_at, u.full_name as user_name,
+                    s.iva_rate, s.iva_amount, s.payment_method, c.full_name as customer_name,
+                    s.seller_id, s.commission_amount, s.commission_rate,
+                    seller.full_name AS seller_name
              FROM sales s
              JOIN users u ON s.user_id = u.id
              LEFT JOIN customers c ON s.customer_id = c.id
+             LEFT JOIN sellers seller ON s.seller_id = seller.id
              WHERE s.id = ?`,
             [id]
         );
@@ -99,7 +117,7 @@ const getSaleById = async (req, res) => {
         }
 
         const [details] = await pool.query(
-            `SELECT sd.quantity, sd.unit_price, sd.unit_cost, 
+            `SELECT sd.quantity, sd.unit_price, sd.unit_cost,
                     p.name as product_name, p.attributes,
                     pb.batch_code, sup.company_name as supplier_name
              FROM sale_details sd
@@ -118,7 +136,17 @@ const getSaleById = async (req, res) => {
 };
 
 const createSale = async (req, res) => {
-    const { total_amount, products, discount = 0, customer_id = null, iva_rate = 0, iva_amount = 0, payment_method = 'efectivo' } = req.body;
+    const {
+        total_amount, products,
+        discount = 0,
+        customer_id = null,
+        iva_rate = 0,
+        iva_amount = 0,
+        payment_method = 'efectivo',
+        seller_id = null,
+        commission_rate,         // opcional: tasa explícita
+        commission_amount,       // opcional: monto explícito (prevalece sobre la tasa)
+    } = req.body;
     const userId = req.uid;
     const connection = await pool.getConnection();
 
@@ -150,9 +178,49 @@ const createSale = async (req, res) => {
             product.cost = batch.cost_per_unit;
         }
 
+        // ── Cálculo de comisión ───────────────────────────────────────
+        let resolvedRate = 0;
+        let resolvedAmount = 0;
+
+        if (seller_id) {
+            const [[seller]] = await connection.query(
+                'SELECT id, commission_rate_default, is_active FROM sellers WHERE id = ?',
+                [seller_id]
+            );
+            if (!seller) {
+                await connection.rollback();
+                return res.status(400).json({ msg: 'Vendedor no encontrado.' });
+            }
+            if (!seller.is_active) {
+                await connection.rollback();
+                return res.status(400).json({ msg: 'El vendedor está inactivo.' });
+            }
+
+            const netAmount = toNumber(total_amount) - toNumber(iva_amount);
+
+            if (commission_amount !== undefined && commission_amount !== null) {
+                resolvedAmount = roundCurrency(commission_amount);
+                resolvedRate = netAmount > 0 ? roundCurrency((resolvedAmount / netAmount) * 100) : 0;
+            } else {
+                resolvedRate = commission_rate !== undefined
+                    ? toNumber(commission_rate)
+                    : toNumber(seller.commission_rate_default);
+                resolvedAmount = roundCurrency(netAmount * resolvedRate / 100);
+            }
+        }
+
         const [saleResult] = await connection.query(
-            'INSERT INTO sales (user_id, customer_id, total_amount, discount, iva_rate, iva_amount, payment_method) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [userId, customer_id, total_amount, discount, iva_rate, iva_amount, payment_method]
+            `INSERT INTO sales
+                (user_id, customer_id, seller_id, total_amount, discount,
+                 iva_rate, iva_amount, payment_method,
+                 commission_amount, commission_rate)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                userId, customer_id, seller_id || null,
+                total_amount, discount,
+                iva_rate, iva_amount, payment_method,
+                resolvedAmount, resolvedRate,
+            ]
         );
         const saleId = saleResult.insertId;
 
@@ -180,13 +248,29 @@ const createSale = async (req, res) => {
 
         const netIncome = parseFloat(total_amount) - parseFloat(iva_amount);
         await connection.query(
-            'INSERT INTO financial_ledger (entry_date, concept, income) VALUES (CURDATE(), ?, ?)',
-            [`Venta (ID: ${saleId})`, netIncome]
+            'INSERT INTO financial_ledger (entry_date, concept, income, sale_id) VALUES (CURDATE(), ?, ?, ?)',
+            [`Venta (ID: ${saleId})`, netIncome, saleId]
         );
 
+        // Registrar comisión pendiente
+        if (seller_id && resolvedAmount !== 0) {
+            await connection.query(
+                `INSERT INTO commissions
+                    (seller_id, sale_id, entry_date, base_amount, rate_percent, amount, status, source, notes)
+                 VALUES (?, ?, CURDATE(), ?, ?, ?, 'pending', 'sale', ?)`,
+                [
+                    seller_id, saleId,
+                    roundCurrency(netIncome),
+                    resolvedRate,
+                    resolvedAmount,
+                    `Comisión auto-generada por venta #${saleId}`,
+                ]
+            );
+        }
+
         await connection.commit();
-        await logAction(userId, `Registró una venta (ID: ${saleId}) por un total de ${total_amount}.`);
-        res.status(201).json({ msg: 'Venta creada exitosamente', saleId });
+        await logAction(userId, `Registró una venta (ID: ${saleId}) por un total de ${total_amount}${seller_id ? ` - vendedor ID ${seller_id}, comisión ${resolvedAmount}` : ''}.`);
+        res.status(201).json({ msg: 'Venta creada exitosamente', saleId, commission_amount: resolvedAmount, commission_rate: resolvedRate });
     } catch (error) {
         await connection.rollback();
         console.error('Error al crear la venta:', error);
@@ -217,10 +301,10 @@ const bulkImportSales = async (req, res) => {
                 product.product_id = dbProduct.id;
 
                 const [[batch]] = await connection.query(
-                    `SELECT id, current_quantity, cost_per_unit 
-                     FROM product_batches 
-                     WHERE product_id = ? AND current_quantity >= ? 
-                     ORDER BY entry_date ASC, id ASC 
+                    `SELECT id, current_quantity, cost_per_unit
+                     FROM product_batches
+                     WHERE product_id = ? AND current_quantity >= ?
+                     ORDER BY entry_date ASC, id ASC
                      LIMIT 1 FOR UPDATE`,
                     [dbProduct.id, product.quantity]
                 );
@@ -280,64 +364,3 @@ const bulkImportSales = async (req, res) => {
 };
 
 module.exports = { getSales, getSaleById, createSale, bulkImportSales };
-
-async function deleteSale(req, res) {
-  const connection = await db.getConnection();
-
-  try {
-    await connection.beginTransaction();
-
-    const saleId = req.params.id;
-
-    // 1. Obtener detalles de la venta
-    const [details] = await connection.query(
-      "SELECT * FROM sale_details WHERE sale_id = ?",
-      [saleId]
-    );
-
-    if (details.length === 0) {
-      throw new Error("Venta no encontrada o ya eliminada");
-    }
-
-    for (const d of details) {
-
-      // 2. Devolver stock al lote
-      await connection.query(`
-        UPDATE product_batches
-        SET current_quantity = current_quantity + ?
-        WHERE id = ?
-      `, [d.quantity, d.batch_id]);
-
-      // 3. Registrar reversa en kardex
-      await connection.query(`
-        INSERT INTO inventory_movements
-        (product_id, batch_id, movement_type, quantity, reference_type, reference_id, notes)
-        VALUES (?, ?, 'IN', ?, 'sale_reversal', ?, 'Anulación de venta')
-      `, [d.product_id, d.batch_id, d.quantity, saleId]);
-    }
-
-    // 4. Eliminar detalles
-    await connection.query(
-      "DELETE FROM sale_details WHERE sale_id = ?",
-      [saleId]
-    );
-
-    // 5. Eliminar venta
-    await connection.query(
-      "DELETE FROM sales WHERE id = ?",
-      [saleId]
-    );
-
-    await connection.commit();
-
-    res.json({ message: "Venta anulada correctamente" });
-
-  } catch (error) {
-    await connection.rollback();
-    res.status(500).json({ error: error.message });
-  } finally {
-    connection.release();
-  }
-}
-
-

@@ -8,7 +8,9 @@ const app = express();
 
 // Middlewares
 app.use(cors());
-app.use(express.json());
+// Aumentamos el límite del body para permitir el JSON de la importación
+// histórica (40 filas, bastante amplio para futuros imports).
+app.use(express.json({ limit: '10mb' }));
 app.use(morgan('dev'));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -28,11 +30,16 @@ app.use('/api/categories', require('./routes/categories.routes'));
 app.use('/api/customers', require('./routes/customers.routes'));
 app.use('/api/config', require('./routes/config.routes'));
 
-// --- NUEVA RUTA DE LOTES ---
+// --- RUTA DE LOTES ---
 app.use('/api/batches', require('./routes/batches.routes'));
 
 // --- RUTA DE LOTES VERDES (materia prima → derivados) ---
 app.use('/api/green-lots', require('./routes/greenLots.routes'));
+
+// --- NUEVOS MÓDULOS: vendedores, comisiones, reimportación histórica ---
+app.use('/api/sellers', require('./routes/sellers.routes'));
+app.use('/api/commissions', require('./routes/commissions.routes'));
+app.use('/api/historical-import', require('./routes/historicalImport.routes'));
 
 // Iniciar el servidor
 const PORT = process.env.PORT || 4000;
