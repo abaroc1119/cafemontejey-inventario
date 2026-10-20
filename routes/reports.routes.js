@@ -7,7 +7,7 @@ const { validateFields } = require('../middlewares/validate-fields');
 
 const router = Router();
 
-//router.use(validateJWT, isAdminRole);
+router.use(validateJWT, isAdminRole);
 
 router.get('/financial-ledger', getFinancialLedger);
 

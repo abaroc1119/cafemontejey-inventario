@@ -11,6 +11,7 @@ const {
 
 const { validateJWT } = require('../middlewares/validate-jwt');
 const { validateFields } = require('../middlewares/validate-fields');
+const { isAdminRole } = require('../middlewares/validate-roles');
 
 const router = Router();
 
@@ -50,7 +51,16 @@ router.post('/', [
     validateFields
 ], createLayawayPlan);
 
-router.put('/:id', updateLayawayPlan);
-router.delete('/:id', deleteLayawayPlan);
+router.put('/:id', [
+    check('id', 'ID inválido').isInt({ gt: 0 }),
+    check('new_payment_amount', 'El abono debe ser un número mayor que cero.').isFloat({ gt: 0 }),
+    validateFields
+], updateLayawayPlan);
+
+router.delete('/:id', [
+    isAdminRole,
+    check('id', 'ID inválido').isInt({ gt: 0 }),
+    validateFields
+], deleteLayawayPlan);
 
 module.exports = router;

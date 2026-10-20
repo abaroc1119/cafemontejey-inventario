@@ -1,6 +1,7 @@
 const { Router } = require('express');
 const { check, body } = require('express-validator');
 const multer = require('multer');
+const crypto = require('crypto');
 const path = require('path');
 
 // --- 1. IMPORTACIONES ACTUALIZADAS ---
@@ -21,18 +22,39 @@ const { validateFields } = require('../middlewares/validate-fields');
 
 const router = Router();
 
-// Configuración de Multer (sin cambios)
+// Solo se aceptan imágenes rasterizadas (no SVG ni HTML, que pueden llevar JavaScript).
+const ALLOWED_IMAGE_TYPES = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp' };
+
 const storage = multer.diskStorage({
-    destination: path.join(__dirname, '../public/uploads/profiles'),
-    filename: (req, file, cb) => {
-        cb(null, `${Date.now()}-${file.originalname}`);
-    }
+    destination: path.join(__dirname, '../public/uploads/profiles'),
+    filename: (req, file, cb) => {
+        // Nombre aleatorio con la extensión que corresponde al tipo, sin usar originalname.
+        cb(null, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ALLOWED_IMAGE_TYPES[file.mimetype]}`);
+    }
 });
-const upload = multer({ storage: storage });
+const upload = multer({
+    storage,
+    limits: { fileSize: 2 * 1024 * 1024, files: 1 },
+    fileFilter: (req, file, cb) => {
+        if (ALLOWED_IMAGE_TYPES[file.mimetype]) return cb(null, true);
+        cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', 'profile_photo'));
+    }
+});
+
+// Convierte los errores de multer en respuestas 400 en vez de un 500 genérico.
+const handleUpload = (req, res, next) => {
+    upload.single('profile_photo')(req, res, (err) => {
+        if (!err) return next();
+        const msg = err.code === 'LIMIT_FILE_SIZE'
+            ? 'La imagen no puede superar 2 MB.'
+            : 'Solo se permiten imágenes JPG, PNG o WEBP.';
+        return res.status(400).json({ msg });
+    });
+};
 
 router.use(validateJWT);
 
-router.post('/upload-photo', upload.single('profile_photo'), uploadProfilePhoto);
+router.post('/upload-photo', handleUpload, uploadProfilePhoto);
 
 const passwordValidationMsg = 'La contraseña debe tener al menos 8 caracteres, una mayúscula, una minúscula, un número y un caracter especial.';
 const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?~`])[A-Za-z\d!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?~`]{8,}$/;
