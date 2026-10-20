@@ -5,6 +5,9 @@ const { generateJWT } = require('../helpers/jwt.helper');
 const { sendPasswordResetEmail } = require('../helpers/email.helper');
 const { logAction } = require('../helpers/audit.helper');
 
+// El token viaja en el correo; en la base de datos solo queda su hash.
+const hashResetToken = (token) => crypto.createHash('sha256').update(String(token)).digest('hex');
+
 const login = async (req, res) => {
     const { email, password } = req.body;
 
@@ -76,7 +79,7 @@ const forgotPassword = async (req, res) => {
         const expires = new Date(Date.now() + 15 * 60 * 1000);
         await pool.query(
             'UPDATE users SET reset_password_token = ?, reset_password_expires = ? WHERE id = ?',
-            [token, expires, user.id]
+            [hashResetToken(token), expires, user.id]
         );
         await sendPasswordResetEmail(user.email, token);
         res.json({ msg: 'Si existe una cuenta activa con este correo, se ha enviado un enlace de recuperación.' });
@@ -90,7 +93,7 @@ const resetPassword = async (req, res) => {
     const { token } = req.params;
     const { password } = req.body;
     try {
-        const [rows] = await pool.query('SELECT * FROM users WHERE reset_password_token = ? AND reset_password_expires > NOW()', [token]);
+        const [rows] = await pool.query('SELECT * FROM users WHERE reset_password_token = ? AND reset_password_expires > NOW()', [hashResetToken(token)]);
         const user = rows[0];
         if (!user) {
             return res.status(400).json({ msg: 'El token de recuperación es inválido o ha expirado.' });

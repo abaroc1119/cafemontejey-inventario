@@ -144,8 +144,22 @@ const updateLayawayPlan = async (req, res) => {
             return res.status(404).json({ msg: 'Plan separe no encontrado' });
         }
 
-        if (new_payment_amount && !isNaN(new_payment_amount)) {
-            const payment = parseFloat(new_payment_amount);
+        if (plan.status === 'completed') {
+            await connection.rollback();
+            return res.status(400).json({ msg: 'El plan separe ya está pagado por completo.' });
+        }
+
+        const payment = parseFloat(new_payment_amount);
+        if (!Number.isFinite(payment) || payment <= 0) {
+            await connection.rollback();
+            return res.status(400).json({ msg: 'El abono debe ser un número mayor que cero.' });
+        }
+        if (payment > parseFloat(plan.balance_due)) {
+            await connection.rollback();
+            return res.status(400).json({ msg: `El abono supera el saldo pendiente (${plan.balance_due}).` });
+        }
+
+        {
             let { down_payment, balance_due, customer_name } = plan;
 
             down_payment = parseFloat(down_payment) + payment;

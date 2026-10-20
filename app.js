@@ -4,10 +4,34 @@ const morgan = require('morgan');
 const path = require('path');
 require('dotenv').config();
 
+// Sin JWT_SECRET el servidor arranca pero todo login falla; mejor fallar al inicio.
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+    console.error('FALTA JWT_SECRET (mínimo 32 caracteres) en el .env. El servidor no arranca.');
+    process.exit(1);
+}
+
 const app = express();
 
-// Middlewares
-app.use(cors());
+// Si el API corre detrás de un proxy (Render, Railway, Nginx...), define
+// TRUST_PROXY=1 para que el límite de intentos vea la IP real del cliente.
+if (process.env.TRUST_PROXY) {
+    app.set('trust proxy', Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY);
+}
+
+// CORS: solo los orígenes del frontend. CORS_ORIGINS admite varios separados por coma,
+// p. ej. "https://inventario.cafemontejey.com,https://cafemontejey-inventario-qa.vercel.app".
+const allowedOrigins = (process.env.CORS_ORIGINS || process.env.FRONTEND_URL || 'http://localhost:5173')
+    .split(',')
+    .map((o) => o.trim().replace(/\/$/, ''))
+    .filter(Boolean);
+
+app.use(cors({
+    origin: (origin, cb) => {
+        // Peticiones sin Origin (curl, health checks, servidor a servidor) no pasan por CORS.
+        if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+        return cb(null, false);
+    }
+}));
 // Aumentamos el límite del body para permitir el JSON de la importación
 // histórica (40 filas, bastante amplio para futuros imports).
 app.use(express.json({ limit: '10mb' }));
